@@ -1738,6 +1738,7 @@ typedef struct janus_audiobridge_participant {
 	opus_int16 *upsample_buffer;		/* Buffer for upsampling */
 	opus_int16 *downsample_buffer;		/* Buffer for downsampling */
 	float *denoiser_buffer[2];			/* Buffer for denoising */
+	volatile guint64 denoise_frame_count;	/* Counter for denoised frames (for debug logging) */
 #endif
 	/* RTP stuff */
 	JitterBuffer *jitter;	/* Jitter buffer of incoming audio packets */
@@ -2499,7 +2500,7 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 
 #ifdef HAVE_RNNOISE
 	JANUS_LOG(LOG_INFO, "Denoising via RNNoise supported (frame_size=%d)\n", rnnoise_get_frame_size());
-	JANUS_LOG(LOG_DBG, "[RNNoise] Library loaded successfully, DENOISER_FRAME_SIZE=%d\n", DENOISER_FRAME_SIZE);
+	JANUS_LOG(LOG_INFO, "[RNNoise] Library loaded successfully, DENOISER_FRAME_SIZE=%d\n", DENOISER_FRAME_SIZE);
 #else
 	JANUS_LOG(LOG_WARN, "Denoising via RNNoise NOT supported\n");
 #endif
@@ -4478,7 +4479,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		gboolean denoise = (!strcasecmp(request_text, "denoise_enable"));
 		JANUS_LOG(LOG_VERB, "Attempt to %s denoising for a participant in an existing AudioBridge room\n",
 			denoise ? "enable" : "disable");
-		JANUS_LOG(LOG_DBG, "[RNNoise] denoise_%s request received\n", denoise ? "enable" : "disable");
+		JANUS_LOG(LOG_INFO, "[RNNoise] denoise_%s request received\n", denoise ? "enable" : "disable");
 		JANUS_VALIDATE_JSON_OBJECT(root, secret_parameters,
 			error_code, error_cause, TRUE,
 			JANUS_AUDIOBRIDGE_ERROR_MISSING_ELEMENT, JANUS_AUDIOBRIDGE_ERROR_INVALID_ELEMENT);
@@ -8954,8 +8955,11 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						pkt->length = opus_decode(participant->decoder, NULL, 0, (opus_int16 *)pkt->data, output_samples, 0);
 #ifdef HAVE_RNNOISE
 						/* Check if we need to denoise this packet */
-						if(participant->denoise)
+						if(participant->denoise) {
+							JANUS_LOG(LOG_INFO, "[RNNoise] Calling denoise (PLC path) for participant %s: pkt->length=%d\n",
+								participant->user_id_str ? participant->user_id_str : "unknown", pkt->length);
 							janus_audiobridge_participant_denoise(participant, (char *)pkt->data, pkt->length);
+						}
 #endif
 						/* Update the details */
 						participant->last_seq = pkt->seq_number;
@@ -9042,8 +9046,11 @@ static void *janus_audiobridge_participant_thread(void *data) {
 					}
 #ifdef HAVE_RNNOISE
 					/* Check if we need to denoise this packet */
-					if(participant->denoise)
+					if(participant->denoise) {
+						JANUS_LOG(LOG_INFO, "[RNNoise] Calling denoise for participant %s: pkt->length=%d\n",
+							participant->user_id_str ? participant->user_id_str : "unknown", pkt->length);
 						janus_audiobridge_participant_denoise(participant, (char *)pkt->data, pkt->length);
+					}
 #endif
 					/* Get rid of the buffered packet */
 					janus_audiobridge_buffer_packet_destroy(bpkt);
@@ -9499,7 +9506,7 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 	gboolean should_log = (log_count % DENOISE_LOG_INTERVAL == 0);
 
 	if(should_log) {
-		JANUS_LOG(LOG_HUGE, "[RNNoise] denoise called: participant=%s, len=%d, stereo=%d, rate=%d, denoise_flag=%d\n",
+		JANUS_LOG(LOG_INFO, "[RNNoise] denoise called: participant=%s, len=%d, stereo=%d, rate=%d, denoise_flag=%d\n",
 			participant->user_id_str ? participant->user_id_str : "unknown",
 			len, participant->stereo, participant->sampling_rate, participant->denoise);
 	}
@@ -9595,12 +9602,12 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 			}
 			if(participant->upsample_buffer == NULL) {
 				participant->upsample_buffer = g_malloc(2 * OPUS_SAMPLES * sizeof(opus_int16));
-				JANUS_LOG(LOG_DBG, "[RNNoise] Allocated upsample_buffer for participant %s: ptr=%p\n",
+				JANUS_LOG(LOG_INFO, "[RNNoise] Allocated upsample_buffer for participant %s: ptr=%p\n",
 					participant->user_id_str ? participant->user_id_str : "unknown", participant->upsample_buffer);
 			}
 			if(participant->downsample_buffer == NULL) {
 				participant->downsample_buffer = g_malloc(2 * OPUS_SAMPLES * sizeof(opus_int16));
-				JANUS_LOG(LOG_DBG, "[RNNoise] Allocated downsample_buffer for participant %s: ptr=%p\n",
+				JANUS_LOG(LOG_INFO, "[RNNoise] Allocated downsample_buffer for participant %s: ptr=%p\n",
 					participant->user_id_str ? participant->user_id_str : "unknown", participant->downsample_buffer);
 			}
 		} else {
@@ -9616,10 +9623,21 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 	/* Actual length of the resampled array (double size for stereo) */
 	const int samples_len = !participant->resampler_stereo ? samples_count : 2*samples_count;
 
-	/* Should be 960 */
-	int upsample_buffer_count = len * (48000/participant->resampler_rate);
+	/* Safety check for resampler_rate - should be set by now, but default to 48000 if not */
+	if(participant->resampler_rate == 0) {
+		JANUS_LOG(LOG_WARN, "[RNNoise] resampler_rate is 0, defaulting to 48000\n");
+		participant->resampler_rate = 48000;
+	}
+
+	/* Should be 960 for 48kHz input */
+	int upsample_buffer_count = len * (48000 / participant->resampler_rate);
 	/* Upsampled buffer */
 	opus_int16 *upsample_buffer = samples;
+
+	if(should_log) {
+		JANUS_LOG(LOG_INFO, "[RNNoise] Buffer setup: len=%d, samples_count=%d, samples_len=%d, upsample_buffer_count=%d, resampler_rate=%d\n",
+			len, samples_count, samples_len, upsample_buffer_count, participant->resampler_rate);
+	}
 
 	/* Downsampled data samples count is equal to original samples */
 	int downsample_buffer_count = samples_count;
@@ -9645,7 +9663,7 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 		upsample_buffer = participant->upsample_buffer;
 		janus_audiobridge_participant_upsample(participant, samples, &samples_count, upsample_buffer, &upsample_buffer_count);
 		if(should_log) {
-			JANUS_LOG(LOG_HUGE, "[RNNoise] Upsampled for participant %s: in_count=%d, out_count=%d\n",
+			JANUS_LOG(LOG_INFO, "[RNNoise] Upsampled for participant %s: in_count=%d, out_count=%d\n",
 				participant->user_id_str ? participant->user_id_str : "unknown", len, upsample_buffer_count);
 		}
 	}
@@ -9663,6 +9681,17 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 	if(participant->resampler_stereo && denoiser_buffer_alt == NULL) {
 		JANUS_LOG(LOG_ERR, "[RNNoise] denoiser_buffer[1] is NULL for stereo, cannot denoise\n");
 		return;
+	}
+
+	/* Track if this is the first frame for this participant */
+	guint64 prev_frame_count = participant->denoise_frame_count;
+
+	/* Log before entering denoise loop (only on first call or periodically) */
+	if(prev_frame_count == 0) {
+		JANUS_LOG(LOG_INFO, "[RNNoise] About to denoise for participant %s: upsample_buffer_count=%d, DENOISER_FRAME_SIZE=%d, stereo=%d, upsample_buffer=%p, denoiser_buffer=%p\n",
+			participant->user_id_str ? participant->user_id_str : "unknown",
+			upsample_buffer_count, DENOISER_FRAME_SIZE, participant->resampler_stereo,
+			upsample_buffer, denoiser_buffer);
 	}
 
 	/* Denoise in chunks of 480 samples */
@@ -9693,6 +9722,23 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 		}
 	}
 
+	/* Update participant's frame counter */
+	participant->denoise_frame_count += frames_processed;
+
+	/* Log first frame processing (one-time log per participant) */
+	if(prev_frame_count == 0 && frames_processed > 0) {
+		JANUS_LOG(LOG_INFO, "[RNNoise] First frame processed for participant %s: %d RNNoise frames in this packet, rate=%dHz, stereo=%d\n",
+			participant->user_id_str ? participant->user_id_str : "unknown",
+			frames_processed, participant->resampler_rate, participant->resampler_stereo);
+	}
+
+	/* Periodic stats logging every ~10 seconds (500 packets at 50pps = 10s) */
+	if(participant->denoise_frame_count > 0 && (participant->denoise_frame_count % 1000) < (guint64)frames_processed) {
+		JANUS_LOG(LOG_INFO, "[RNNoise] Participant %s: total frames denoised so far: %"G_GUINT64_FORMAT"\n",
+			participant->user_id_str ? participant->user_id_str : "unknown",
+			participant->denoise_frame_count);
+	}
+
 	/* Downsample */
 	if(participant->resampler_rate != 48000) {
 		if(participant->downsample_buffer == NULL || participant->downsampler == NULL) {
@@ -9703,7 +9749,7 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 		downsample_buffer = participant->downsample_buffer;
 		janus_audiobridge_participant_downsample(participant, upsample_buffer, &upsample_buffer_count, downsample_buffer, &downsample_buffer_count);
 		if(should_log) {
-			JANUS_LOG(LOG_HUGE, "[RNNoise] Downsampled for participant %s: in_count=%d, out_count=%d\n",
+			JANUS_LOG(LOG_INFO, "[RNNoise] Downsampled for participant %s: in_count=%d, out_count=%d\n",
 				participant->user_id_str ? participant->user_id_str : "unknown", upsample_buffer_count, downsample_buffer_count);
 		}
 	}
@@ -9719,7 +9765,7 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 		}
 		output_rms = sqrtf(output_rms / (samples_len < 100 ? samples_len : 100));
 		float reduction_db = (input_rms > 0 && output_rms > 0) ? 20.0f * log10f(output_rms / input_rms) : 0.0f;
-		JANUS_LOG(LOG_HUGE, "[RNNoise] Processed for participant %s: frames=%d, stereo=%d, input_rms=%.1f, output_rms=%.1f, reduction=%.1fdB\n",
+		JANUS_LOG(LOG_INFO, "[RNNoise] Processed for participant %s: frames=%d, stereo=%d, input_rms=%.1f, output_rms=%.1f, reduction=%.1fdB\n",
 			participant->user_id_str ? participant->user_id_str : "unknown",
 			frames_processed, participant->resampler_stereo, input_rms, output_rms, reduction_db);
 	}
