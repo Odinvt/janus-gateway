@@ -9485,7 +9485,7 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 #ifdef HAVE_RNNOISE
 /* Counter for throttling debug logs in the hot path */
 static volatile guint32 denoise_log_counter = 0;
-#define DENOISE_LOG_INTERVAL 500  /* Log every N frames to avoid flooding */
+#define DENOISE_LOG_INTERVAL 50  /* Log every N frames (debug build - verbose) */
 
 static void janus_audiobridge_participant_denoise(janus_audiobridge_participant *participant, char *data, int len) {
 	if(participant == NULL) {
@@ -9697,27 +9697,68 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 	/* Denoise in chunks of 480 samples */
 	if(!participant->resampler_stereo) {
 		for(i=0; i<upsample_buffer_count; i+= DENOISER_FRAME_SIZE) {
+			/* Calculate pre-denoise energy for this chunk */
+			float pre_energy = 0.0f;
 			for(j=0; j<DENOISER_FRAME_SIZE; j++) {
 				denoiser_buffer[j] = upsample_buffer[i + j];
+				pre_energy += denoiser_buffer[j] * denoiser_buffer[j];
 			}
-			rnnoise_process_frame(participant->rnnoise[0], denoiser_buffer, denoiser_buffer);
-			frames_processed++;
+			pre_energy = sqrtf(pre_energy / DENOISER_FRAME_SIZE);
+
+			/* Call RNNoise - returns VAD probability (0.0 to 1.0) */
+			float vad_prob = rnnoise_process_frame(participant->rnnoise[0], denoiser_buffer, denoiser_buffer);
+
+			/* Calculate post-denoise energy for this chunk */
+			float post_energy = 0.0f;
 			for(j=0; j<DENOISER_FRAME_SIZE; j++) {
+				post_energy += denoiser_buffer[j] * denoiser_buffer[j];
 				upsample_buffer[i + j] = denoiser_buffer[j];
+			}
+			post_energy = sqrtf(post_energy / DENOISER_FRAME_SIZE);
+
+			frames_processed++;
+
+			/* Log every frame for debugging */
+			if(should_log || prev_frame_count == 0) {
+				JANUS_LOG(LOG_INFO, "[RNNoise] Frame %d: rnnoise_process_frame returned vad_prob=%.3f, pre_energy=%.1f, post_energy=%.1f, reduction=%.1fdB\n",
+					frames_processed, vad_prob, pre_energy, post_energy,
+					(pre_energy > 0 && post_energy > 0) ? 20.0f * log10f(post_energy / pre_energy) : 0.0f);
 			}
 		}
 	} else {
 		for(i=0; i<upsample_buffer_count; i+= DENOISER_FRAME_SIZE) {
+			/* Calculate pre-denoise energy for this chunk */
+			float pre_energy = 0.0f, pre_energy_alt = 0.0f;
 			for(j=0; j<DENOISER_FRAME_SIZE; j++) {
 				denoiser_buffer[j] = upsample_buffer[2*i + 2*j];
 				denoiser_buffer_alt[j] = upsample_buffer[2*i + 2*j + 1];
+				pre_energy += denoiser_buffer[j] * denoiser_buffer[j];
+				pre_energy_alt += denoiser_buffer_alt[j] * denoiser_buffer_alt[j];
 			}
-			rnnoise_process_frame(participant->rnnoise[0], denoiser_buffer, denoiser_buffer);
-			rnnoise_process_frame(participant->rnnoise[1], denoiser_buffer_alt, denoiser_buffer_alt);
-			frames_processed++;
+			pre_energy = sqrtf(pre_energy / DENOISER_FRAME_SIZE);
+			pre_energy_alt = sqrtf(pre_energy_alt / DENOISER_FRAME_SIZE);
+
+			/* Call RNNoise - returns VAD probability (0.0 to 1.0) */
+			float vad_prob = rnnoise_process_frame(participant->rnnoise[0], denoiser_buffer, denoiser_buffer);
+			float vad_prob_alt = rnnoise_process_frame(participant->rnnoise[1], denoiser_buffer_alt, denoiser_buffer_alt);
+
+			/* Calculate post-denoise energy */
+			float post_energy = 0.0f, post_energy_alt = 0.0f;
 			for(j=0; j<DENOISER_FRAME_SIZE; j++) {
+				post_energy += denoiser_buffer[j] * denoiser_buffer[j];
+				post_energy_alt += denoiser_buffer_alt[j] * denoiser_buffer_alt[j];
 				upsample_buffer[2*i + 2*j] = denoiser_buffer[j];
 				upsample_buffer[2*i + 2*j + 1] = denoiser_buffer_alt[j];
+			}
+			post_energy = sqrtf(post_energy / DENOISER_FRAME_SIZE);
+			post_energy_alt = sqrtf(post_energy_alt / DENOISER_FRAME_SIZE);
+
+			frames_processed++;
+
+			/* Log every frame for debugging */
+			if(should_log || prev_frame_count == 0) {
+				JANUS_LOG(LOG_INFO, "[RNNoise] Stereo Frame %d: vad_prob L=%.3f R=%.3f, pre_energy L=%.1f R=%.1f, post_energy L=%.1f R=%.1f\n",
+					frames_processed, vad_prob, vad_prob_alt, pre_energy, pre_energy_alt, post_energy, post_energy_alt);
 			}
 		}
 	}
